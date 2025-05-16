@@ -237,7 +237,8 @@ def compute_3x2pt_cls(
 
 def flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk):
     """
-    JAX-safe version: Flatten cl_gg (auto only), cl_gk, and cl_kk into a 1D data vector.
+    JAX-safe: Flatten cl_gg (auto only), cl_gk (only j >= i), and cl_kk (only i <= j)
+    into a 1D data vector.
 
     Parameters
     ----------
@@ -252,52 +253,60 @@ def flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk):
     n_lens, _, n_ell = cl_gg.shape
     n_src = cl_kk.shape[0]
 
-    # Extract cl_gg auto terms only (i == j)
+    # Auto-only cl_gg
     cl_gg_auto = jnp.diagonal(cl_gg, axis1=0, axis2=1)  # (n_ell, n_lens)
     cl_gg_auto = cl_gg_auto.T  # shape (n_lens, n_ell)
-
-    # Reshape everything to (N_block × N_ell,) and concatenate
     gg_flat = cl_gg_auto.reshape(-1)
-    gk_flat = cl_gk.reshape(-1)
-    kk_flat = cl_kk.reshape(-1)
 
-    data_vector = jnp.concatenate([gg_flat, gk_flat, kk_flat])
-    return data_vector
+    # cl_gk: only j >= i
+    gk_flat_list = []
+    for i in range(n_lens):
+        for j in range(i, n_src):
+            gk_flat_list.append(cl_gk[i, j])
+    gk_flat = jnp.concatenate(gk_flat_list, axis=0)
+
+    # cl_kk: only i <= j
+    kk_flat_list = []
+    for i in range(n_src):
+        for j in range(i, n_src):
+            kk_flat_list.append(cl_kk[i, j])
+    kk_flat = jnp.concatenate(kk_flat_list, axis=0)
+
+    return jnp.concatenate([gg_flat, gk_flat, kk_flat])
 
 
 
-
+import numpy as np
+import jax.numpy as jnp
 
 def compute_gaussian_covariance_matrix(
     cl_gg, cl_gk, cl_kk, ell, n_eff, sigma_eps_sq, fsky
 ):
     """
-    Compute Gaussian covariance matrix of the 3x2pt data vector.
+    Compute Gaussian covariance matrix for 3x2pt data vector.
+
+    - Includes cl_gg[i,i]
+    - Includes cl_gk[i,j] only when j >= i
+    - Includes cl_kk[i,j] only when i <= j
 
     Parameters
     ----------
-    cl_gg, cl_gk, cl_kk : arrays of shape (n_i, n_j, n_ell)
-        Angular power spectra (can be JAX arrays; will be converted to NumPy).
-
-    ell : array (n_ell,)
-        Central multipoles of the bins.
-
+    cl_gg, cl_gk, cl_kk : ndarray
+        Angular power spectra.
+    ell : (n_ell,) array
+        Bandpower centers.
     n_eff : float
-        Effective galaxy number density (arcmin^{-2}).
-
+        Effective galaxy number density [arcmin^-2].
     sigma_eps_sq : float
-        Shape noise variance per component.
-
+        Shape noise variance.
     fsky : float
-        Sky fraction.
+        Fraction of sky observed.
 
     Returns
     -------
-    cov : jnp.ndarray, shape (n_data, n_data)
-        Gaussian covariance matrix (as JAX array).
+    cov : jnp.ndarray
+        Gaussian covariance matrix (shape [n_data, n_data]).
     """
-    # --- Convert to NumPy arrays ---
-    import numpy as np
     cl_gg = np.array(cl_gg)
     cl_gk = np.array(cl_gk)
     cl_kk = np.array(cl_kk)
@@ -307,47 +316,48 @@ def compute_gaussian_covariance_matrix(
     n_src = cl_kk.shape[0]
     n_ell = ell.shape[0]
 
-    # --- Compute delta_ell from ell spacing ---
+    # Compute delta_ell from ell spacing
     edges = 0.5 * (ell[1:] + ell[:-1])
     delta_ell = np.empty_like(ell)
     delta_ell[1:-1] = edges[1:] - edges[:-1]
     delta_ell[0] = edges[0] - ell[0]
     delta_ell[-1] = ell[-1] - edges[-1]
 
-    # --- Add shot/shape noise ---
+    # Add noise
     for i in range(n_lens):
         cl_gg[i, i, :] += 1.0 / n_eff
     for i in range(n_src):
         cl_kk[i, i, :] += sigma_eps_sq / n_eff
 
-    # --- Flatten the Cls and build label map ---
-    data_vector = []
+    # Build data vector labels
     labels = []
 
     for i in range(n_lens):
         for l in range(n_ell):
-            data_vector.append(cl_gg[i, i, l])
             labels.append(("gg", i, i, l))
 
     for i in range(n_lens):
-        for j in range(n_src):
+        for j in range(i, n_src):  # j >= i
             for l in range(n_ell):
-                data_vector.append(cl_gk[i, j, l])
                 labels.append(("gk", i, j, l))
 
     for i in range(n_src):
-        for j in range(n_src):
+        for j in range(i, n_src):  # i <= j
             for l in range(n_ell):
-                data_vector.append(cl_kk[i, j, l])
                 labels.append(("kk", i, j, l))
 
-    n_data = len(data_vector)
+    n_data = len(labels)
     cov = np.zeros((n_data, n_data))
 
-    def get_cl(t, i, j, l):
-        if t == "gg": return cl_gg[i, j, l]
-        if t == "gk": return cl_gk[i, j, l]
-        if t == "kk": return cl_kk[i, j, l]
+    def get_cl(tag, i, j, l):
+        if tag == "gg":
+            return cl_gg[i, j, l]
+        elif tag == "gk":
+            return cl_gk[i, j, l]
+        elif tag == "kk":
+            return cl_kk[i, j, l]
+        else:
+            raise ValueError(f"Unknown tag {tag}")
 
     for a in range(n_data):
         t1, i1, j1, l1 = labels[a]
@@ -366,7 +376,7 @@ def compute_gaussian_covariance_matrix(
 
             cov_ab = prefac * (c1 * c2 + c3 * c4)
             cov[a, b] = cov_ab
-            cov[b, a] = cov_ab  # symmetry
+            cov[b, a] = cov_ab
 
     return jnp.array(cov)
 
