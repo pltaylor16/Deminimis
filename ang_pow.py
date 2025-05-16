@@ -267,6 +267,7 @@ def flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk):
 
 
 
+
 def compute_gaussian_covariance_matrix(
     cl_gg, cl_gk, cl_kk, ell, n_eff, sigma_eps_sq, fsky
 ):
