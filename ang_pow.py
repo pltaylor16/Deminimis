@@ -1,6 +1,5 @@
 import jax.numpy as jnp
 from jax import vmap
-from cosmopower_jax.cosmopower_jax import CosmoPowerJAX as CPJ
 from jax import lax
 
 
@@ -96,7 +95,7 @@ def compute_nz_bins(z, n_bins, z0=0.64):
     return nz
 
 
-def compute_nonlinear_pk(z_vals, cosmo_params, c_min, eta_0):
+def compute_nonlinear_pk(z_vals, cosmo_params, c_min, eta_0, emulator):
     """
     Compute nonlinear matter power spectrum using CosmoPower-JAX.
 
@@ -115,6 +114,9 @@ def compute_nonlinear_pk(z_vals, cosmo_params, c_min, eta_0):
     eta_0 : float
         HMCode baryonic feedback parameter eta_0.
 
+    emulator : CosmoPowerJAX instance
+        Pre-initialized emulator with probe='mpk_nonlin'.
+
     Returns
     -------
     k : jnp.ndarray
@@ -124,23 +126,21 @@ def compute_nonlinear_pk(z_vals, cosmo_params, c_min, eta_0):
         Nonlinear matter power spectrum (shape: [n_z, n_k]),
         where pk[i, j] = P(k[j], z_vals[i]).
     """
-    # Instantiate emulator
-    emulator = CPJ(probe='mpk_nonlin')
-
-    # Expand parameters for each z
     omega_b, omega_cdm, h, n_s, ln10As = cosmo_params
+
+    # Broadcast params for each redshift
+    n_z = z_vals.shape[0]
     param_array = jnp.stack([
-        jnp.full_like(z_vals, omega_b),
-        jnp.full_like(z_vals, omega_cdm),
-        jnp.full_like(z_vals, h),
-        jnp.full_like(z_vals, n_s),
-        jnp.full_like(z_vals, ln10As),
-        jnp.full_like(z_vals, c_min),
-        jnp.full_like(z_vals, eta_0),
+        jnp.full((n_z,), omega_b),
+        jnp.full((n_z,), omega_cdm),
+        jnp.full((n_z,), h),
+        jnp.full((n_z,), n_s),
+        jnp.full((n_z,), ln10As),
+        jnp.full((n_z,), c_min),
+        jnp.full((n_z,), eta_0),
         z_vals
     ], axis=1)  # shape (n_z, 8)
 
-    # Predict power spectra
     pk = emulator.predict(param_array)  # shape (n_z, n_k)
     k = emulator.modes  # shape (n_k,)
 
