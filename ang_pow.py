@@ -264,95 +264,109 @@ def flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk):
     return data_vector
 
 
-def compute_gaussian_covariance_binned(
-    nz_lens, nz_source, z, k, p_k, ell,
-    delta_z_lens, delta_z_source, m_bias, galaxy_bias,
-    h, omega_b, omega_cdm,
-    n_eff, sigma_eps_sq, fsky
+
+
+def compute_gaussian_covariance_matrix(
+    cl_gg, cl_gk, cl_kk, ell, n_eff, sigma_eps_sq, fsky
 ):
     """
-    Gaussian covariance for binned Cls using Wick's theorem with auto-computed delta_ell.
+    Compute Gaussian covariance matrix of the 3x2pt data vector.
 
     Parameters
     ----------
+    cl_gg, cl_gk, cl_kk : arrays of shape (n_i, n_j, n_ell)
+        Angular power spectra (can be JAX arrays; will be converted to NumPy).
+
     ell : array (n_ell,)
         Central multipoles of the bins.
 
+    n_eff : float
+        Effective galaxy number density (arcmin^{-2}).
+
+    sigma_eps_sq : float
+        Shape noise variance per component.
+
+    fsky : float
+        Sky fraction.
+
     Returns
     -------
-    cov : (n_data, n_data) jnp.ndarray
+    cov : jnp.ndarray, shape (n_data, n_data)
+        Gaussian covariance matrix (as JAX array).
     """
-    # --- Auto-compute delta_ell from ell spacing ---
+    # --- Convert to NumPy arrays ---
+    import numpy as np
+    cl_gg = np.array(cl_gg)
+    cl_gk = np.array(cl_gk)
+    cl_kk = np.array(cl_kk)
+    ell = np.array(ell)
+
+    n_lens = cl_gg.shape[0]
+    n_src = cl_kk.shape[0]
+    n_ell = ell.shape[0]
+
+    # --- Compute delta_ell from ell spacing ---
     edges = 0.5 * (ell[1:] + ell[:-1])
-    delta_ell = jnp.empty_like(ell)
-    delta_ell = delta_ell.at[1:-1].set(edges[1:] - edges[:-1])
-    delta_ell = delta_ell.at[0].set(edges[0] - ell[0])
-    delta_ell = delta_ell.at[-1].set(ell[-1] - edges[-1])
+    delta_ell = np.empty_like(ell)
+    delta_ell[1:-1] = edges[1:] - edges[:-1]
+    delta_ell[0] = edges[0] - ell[0]
+    delta_ell[-1] = ell[-1] - edges[-1]
 
-    # --- Compute Cls ---
-    cl_gg, cl_gk, cl_kk = compute_3x2pt_cls(
-        nz_lens, nz_source, z, k, p_k, ell,
-        delta_z_lens, delta_z_source, m_bias, galaxy_bias,
-        h, omega_b, omega_cdm
-    )
+    # --- Add shot/shape noise ---
+    for i in range(n_lens):
+        cl_gg[i, i, :] += 1.0 / n_eff
+    for i in range(n_src):
+        cl_kk[i, i, :] += sigma_eps_sq / n_eff
 
-    n_lens = nz_lens.shape[0]
-    n_src  = nz_source.shape[0]
-    n_ell  = ell.shape[0]
-
-    # --- Add noise ---
-    cl_gg = cl_gg.at[jnp.arange(n_lens), jnp.arange(n_lens)].add(1. / n_eff)
-    cl_kk = cl_kk.at[jnp.arange(n_src), jnp.arange(n_src)].add(sigma_eps_sq / n_eff)
-
-    # --- Flatten Cls into data vector (exclude cross-bin gg) ---
-    cl_vector = []
-    cl_index  = []
+    # --- Flatten the Cls and build label map ---
+    data_vector = []
+    labels = []
 
     for i in range(n_lens):
-        cl_vector.append(cl_gg[i, i])  # shape (n_ell,)
-        cl_index.extend([("gg", i, i, l) for l in range(n_ell)])
+        for l in range(n_ell):
+            data_vector.append(cl_gg[i, i, l])
+            labels.append(("gg", i, i, l))
 
     for i in range(n_lens):
         for j in range(n_src):
-            cl_vector.append(cl_gk[i, j])
-            cl_index.extend([("gk", i, j, l) for l in range(n_ell)])
+            for l in range(n_ell):
+                data_vector.append(cl_gk[i, j, l])
+                labels.append(("gk", i, j, l))
 
     for i in range(n_src):
         for j in range(n_src):
-            cl_vector.append(cl_kk[i, j])
-            cl_index.extend([("kk", i, j, l) for l in range(n_ell)])
+            for l in range(n_ell):
+                data_vector.append(cl_kk[i, j, l])
+                labels.append(("kk", i, j, l))
 
-    cl_vector = jnp.concatenate(cl_vector)
-    n_data = len(cl_index)
+    n_data = len(data_vector)
+    cov = np.zeros((n_data, n_data))
 
-    # --- Initialize covariance matrix ---
-    cov = jnp.zeros((n_data, n_data))
+    def get_cl(t, i, j, l):
+        if t == "gg": return cl_gg[i, j, l]
+        if t == "gk": return cl_gk[i, j, l]
+        if t == "kk": return cl_kk[i, j, l]
 
-    # --- Wick's theorem ---
     for a in range(n_data):
-        t1, i1, j1, l1 = cl_index[a]
-        for b in range(n_data):
-            t2, i2, j2, l2 = cl_index[b]
+        t1, i1, j1, l1 = labels[a]
+        for b in range(a, n_data):
+            t2, i2, j2, l2 = labels[b]
             if l1 != l2:
                 continue
-
-            ell_val = ell[l1]
-            d_ell = delta_ell[l1]
-            prefactor = 2. / ((2 * ell_val + 1) * d_ell * fsky)
-
-            def get_cl(type_, i, j, l):
-                if type_ == "gg": return cl_gg[i, j, l]
-                if type_ == "gk": return cl_gk[i, j, l]
-                if type_ == "kk": return cl_kk[i, j, l]
+            ℓ = ell[l1]
+            Δℓ = delta_ell[l1]
+            prefac = 2.0 / ((2 * ℓ + 1) * Δℓ * fsky)
 
             c1 = get_cl(t1, i1, i2, l1)
             c2 = get_cl(t2, j1, j2, l1)
             c3 = get_cl(t1, i1, j2, l1)
             c4 = get_cl(t2, j1, i2, l1)
 
-            cov = cov.at[a, b].set(prefactor * (c1 * c2 + c3 * c4))
+            cov_ab = prefac * (c1 * c2 + c3 * c4)
+            cov[a, b] = cov_ab
+            cov[b, a] = cov_ab  # symmetry
 
-    return cov
+    return jnp.array(cov)
 
 
 
