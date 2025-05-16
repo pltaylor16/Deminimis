@@ -1,6 +1,7 @@
 import jax.numpy as jnp
 from jax import vmap
 from jax import lax
+from jax.scipy.linalg import cho_solve, cho_factor
 
 
 def linear_interp1d(x, y):
@@ -212,7 +213,7 @@ def compute_3x2pt_cls(
         k_vals = jnp.where(chi > 0, ell_val / chi, 0.0)
         k_vals = jnp.clip(k_vals, k[0] + 1e-6, k[-1] - 1e-6)
         P_ell = interp2d_linear(z, k, p_k, z, k_vals)
-        print("W1", W1.shape, "W2", W2.shape, "P_ell", P_ell.shape, "w_z", w_z.shape)
+        #print("W1", W1.shape, "W2", W2.shape, "P_ell", P_ell.shape, "w_z", w_z.shape)
         return jax_trapz(W1 * W2 * P_ell * w_z, z)
 
     def cl_gg_fn(i, j):
@@ -368,6 +369,47 @@ def compute_gaussian_covariance_matrix(
 
     return jnp.array(cov)
 
+
+def gaussian_loglike(
+    nz_lens, nz_source, z, k, p_k, ell,
+    delta_z_lens, delta_z_source, m_bias, galaxy_bias,
+    h, omega_b, omega_cdm,
+    cov, data_vector_fid
+):
+    """
+    JAX-safe Gaussian log-likelihood for 3x2pt data vector.
+
+    Parameters
+    ----------
+    All inputs match compute_3x2pt_cls, plus:
+
+    cov : (n_data, n_data) ndarray (NOT traced)
+        Precomputed data covariance matrix (NumPy or JAX array, assumed constant).
+
+    data_vector_fid : (n_data,) jnp.ndarray
+        Fiducial data vector (used as the observed data).
+
+    Returns
+    -------
+    loglike : float
+        Gaussian log-likelihood value.
+    """
+    cl_gg, cl_gk, cl_kk = compute_3x2pt_cls(
+        nz_lens, nz_source, z, k, p_k, ell,
+        delta_z_lens, delta_z_source, m_bias, galaxy_bias,
+        h, omega_b, omega_cdm
+    )
+
+    model_vector = flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk)
+    delta = model_vector - data_vector_fid
+
+    # Cholesky solve is faster + stable than full inverse
+    cov = jnp.asarray(cov)
+    L, lower = cho_factor(cov, lower=True)
+    chi2 = delta @ cho_solve((L, lower), delta)
+
+    loglike = -0.5 * chi2
+    return loglike
 
 
 
