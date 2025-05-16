@@ -307,8 +307,125 @@ def compute_3x2pt_cls(
     return cl_gg, cl_gk, cl_kk
 
 
+def flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk):
+    """
+    JAX-safe version: Flatten cl_gg (auto only), cl_gk, and cl_kk into a 1D data vector.
+
+    Parameters
+    ----------
+    cl_gg : (n_lens, n_lens, n_ell)
+    cl_gk : (n_lens, n_source, n_ell)
+    cl_kk : (n_source, n_source, n_ell)
+
+    Returns
+    -------
+    data_vector : jnp.ndarray, shape (n_data,)
+    """
+    n_lens, _, n_ell = cl_gg.shape
+    n_src = cl_kk.shape[0]
+
+    # Extract cl_gg auto terms only (i == j)
+    cl_gg_auto = jnp.diagonal(cl_gg, axis1=0, axis2=1)  # (n_ell, n_lens)
+    cl_gg_auto = cl_gg_auto.T  # shape (n_lens, n_ell)
+
+    # Reshape everything to (N_block × N_ell,) and concatenate
+    gg_flat = cl_gg_auto.reshape(-1)
+    gk_flat = cl_gk.reshape(-1)
+    kk_flat = cl_kk.reshape(-1)
+
+    data_vector = jnp.concatenate([gg_flat, gk_flat, kk_flat])
+    return data_vector
 
 
+def compute_gaussian_covariance_binned(
+    nz_lens, nz_source, z, k, p_k, ell,
+    delta_z_lens, delta_z_source, m_bias, galaxy_bias,
+    h, omega_b, omega_cdm,
+    n_eff, sigma_eps_sq, fsky
+):
+    """
+    Gaussian covariance for binned Cls using Wick's theorem with auto-computed delta_ell.
+
+    Parameters
+    ----------
+    ell : array (n_ell,)
+        Central multipoles of the bins.
+
+    Returns
+    -------
+    cov : (n_data, n_data) jnp.ndarray
+    """
+    # --- Auto-compute delta_ell from ell spacing ---
+    edges = 0.5 * (ell[1:] + ell[:-1])
+    delta_ell = jnp.empty_like(ell)
+    delta_ell = delta_ell.at[1:-1].set(edges[1:] - edges[:-1])
+    delta_ell = delta_ell.at[0].set(edges[0] - ell[0])
+    delta_ell = delta_ell.at[-1].set(ell[-1] - edges[-1])
+
+    # --- Compute Cls ---
+    cl_gg, cl_gk, cl_kk = compute_3x2pt_cls(
+        nz_lens, nz_source, z, k, p_k, ell,
+        delta_z_lens, delta_z_source, m_bias, galaxy_bias,
+        h, omega_b, omega_cdm
+    )
+
+    n_lens = nz_lens.shape[0]
+    n_src  = nz_source.shape[0]
+    n_ell  = ell.shape[0]
+
+    # --- Add noise ---
+    cl_gg = cl_gg.at[jnp.arange(n_lens), jnp.arange(n_lens)].add(1. / n_eff)
+    cl_kk = cl_kk.at[jnp.arange(n_src), jnp.arange(n_src)].add(sigma_eps_sq / n_eff)
+
+    # --- Flatten Cls into data vector (exclude cross-bin gg) ---
+    cl_vector = []
+    cl_index  = []
+
+    for i in range(n_lens):
+        cl_vector.append(cl_gg[i, i])  # shape (n_ell,)
+        cl_index.extend([("gg", i, i, l) for l in range(n_ell)])
+
+    for i in range(n_lens):
+        for j in range(n_src):
+            cl_vector.append(cl_gk[i, j])
+            cl_index.extend([("gk", i, j, l) for l in range(n_ell)])
+
+    for i in range(n_src):
+        for j in range(n_src):
+            cl_vector.append(cl_kk[i, j])
+            cl_index.extend([("kk", i, j, l) for l in range(n_ell)])
+
+    cl_vector = jnp.concatenate(cl_vector)
+    n_data = len(cl_index)
+
+    # --- Initialize covariance matrix ---
+    cov = jnp.zeros((n_data, n_data))
+
+    # --- Wick's theorem ---
+    for a in range(n_data):
+        t1, i1, j1, l1 = cl_index[a]
+        for b in range(n_data):
+            t2, i2, j2, l2 = cl_index[b]
+            if l1 != l2:
+                continue
+
+            ell_val = ell[l1]
+            d_ell = delta_ell[l1]
+            prefactor = 2. / ((2 * ell_val + 1) * d_ell * fsky)
+
+            def get_cl(type_, i, j, l):
+                if type_ == "gg": return cl_gg[i, j, l]
+                if type_ == "gk": return cl_gk[i, j, l]
+                if type_ == "kk": return cl_kk[i, j, l]
+
+            c1 = get_cl(t1, i1, i2, l1)
+            c2 = get_cl(t2, j1, j2, l1)
+            c3 = get_cl(t1, i1, j2, l1)
+            c4 = get_cl(t2, j1, i2, l1)
+
+            cov = cov.at[a, b].set(prefactor * (c1 * c2 + c3 * c4))
+
+    return cov
 
 
 
