@@ -279,57 +279,48 @@ def flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk):
 import numpy as np
 import jax.numpy as jnp
 
+import numpy as np
+import jax.numpy as jnp
+
 def compute_gaussian_covariance_matrix(
     cl_gg, cl_gk, cl_kk, ell, n_eff, sigma_eps_sq, fsky
 ):
     """
     Compute Gaussian covariance matrix for 3x2pt data vector.
-
     - Includes cl_gg[i,i]
     - Includes cl_gk[i,j] only when j >= i
     - Includes cl_kk[i,j] only when i <= j
-
-    Parameters
-    ----------
-    cl_gg, cl_gk, cl_kk : ndarray
-        Angular power spectra.
-    ell : (n_ell,) array
-        Bandpower centers.
-    n_eff : float
-        Effective galaxy number density [arcmin^-2].
-    sigma_eps_sq : float
-        Shape noise variance.
-    fsky : float
-        Fraction of sky observed.
-
-    Returns
-    -------
-    cov : jnp.ndarray
-        Gaussian covariance matrix (shape [n_data, n_data]).
     """
-    cl_gg = np.array(cl_gg)
-    cl_gk = np.array(cl_gk)
-    cl_kk = np.array(cl_kk)
+
+    # Convert to NumPy *after* copying, so we modify noise safely
+    cl_gg = np.array(cl_gg.copy())
+    cl_gk = np.array(cl_gk.copy())
+    cl_kk = np.array(cl_kk.copy())
     ell = np.array(ell)
 
-    n_lens = cl_gg.shape[0]
-    n_src = cl_kk.shape[0]
-    n_ell = ell.shape[0]
+    n_lens, n_src, n_ell = cl_gk.shape[0], cl_kk.shape[0], ell.shape[0]
 
-    # Compute delta_ell from ell spacing
+    # delta_ell bin widths
     edges = 0.5 * (ell[1:] + ell[:-1])
     delta_ell = np.empty_like(ell)
     delta_ell[1:-1] = edges[1:] - edges[:-1]
     delta_ell[0] = edges[0] - ell[0]
     delta_ell[-1] = ell[-1] - edges[-1]
 
-    # Add noise
+    # Add noise *safely*
     for i in range(n_lens):
         cl_gg[i, i, :] += 1.0 / n_eff
     for i in range(n_src):
         cl_kk[i, i, :] += sigma_eps_sq / n_eff
 
-    # Build data vector labels
+    # Enforce cl_kk symmetry explicitly
+    for i in range(n_src):
+        for j in range(i+1, n_src):
+            sym = 0.5 * (cl_kk[i, j, :] + cl_kk[j, i, :])
+            cl_kk[i, j, :] = sym
+            cl_kk[j, i, :] = sym
+
+    # --- Build data vector labels ---
     labels = []
 
     for i in range(n_lens):
@@ -337,12 +328,12 @@ def compute_gaussian_covariance_matrix(
             labels.append(("gg", i, i, l))
 
     for i in range(n_lens):
-        for j in range(i, n_src):  # j >= i
+        for j in range(i, n_src):
             for l in range(n_ell):
                 labels.append(("gk", i, j, l))
 
     for i in range(n_src):
-        for j in range(i, n_src):  # i <= j
+        for j in range(i, n_src):
             for l in range(n_ell):
                 labels.append(("kk", i, j, l))
 
@@ -385,6 +376,50 @@ def gaussian_loglike(
     nz_lens, nz_source, z, k, p_k, ell,
     delta_z_lens, delta_z_source, m_bias, galaxy_bias,
     h, omega_b, omega_cdm,
+    cov_inv, data_vector_fid
+):
+    """
+    JAX-safe Gaussian log-likelihood for 3x2pt data vector using explicit inverse.
+
+    Parameters
+    ----------
+    All inputs match compute_3x2pt_cls, plus:
+
+    cov : (n_data, n_data) ndarray (NumPy or JAX array)
+        Precomputed data covariance matrix (assumed constant).
+
+    data_vector_fid : (n_data,) jnp.ndarray
+        Fiducial data vector (used as the observed data).
+
+    Returns
+    -------
+    loglike : float
+        Gaussian log-likelihood value.
+    """
+    # Compute model Cls
+    cl_gg, cl_gk, cl_kk = compute_3x2pt_cls(
+        nz_lens, nz_source, z, k, p_k, ell,
+        delta_z_lens, delta_z_source, m_bias, galaxy_bias,
+        h, omega_b, omega_cdm
+    )
+
+    # Build model vector
+    model_vector = flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk)
+    delta = model_vector - data_vector_fid
+
+    # Use full inverse instead of Cholesky
+    cov_inv = jnp.asarray(cov_inv)
+    chi2 = delta @ cov_inv @ delta
+
+    return -0.5 * chi2
+
+
+
+''''
+def gaussian_loglike(
+    nz_lens, nz_source, z, k, p_k, ell,
+    delta_z_lens, delta_z_source, m_bias, galaxy_bias,
+    h, omega_b, omega_cdm,
     cov, data_vector_fid
 ):
     """
@@ -419,8 +454,65 @@ def gaussian_loglike(
     L, lower = cho_factor(cov, lower=True)
     chi2 = delta @ cho_solve((L, lower), delta)
 
+    print ('chi2', chi2)
     loglike = -0.5 * chi2
     return loglike
 
 
 
+def gaussian_loglike_debug(
+    nz_lens, nz_source, z, k, p_k, ell,
+    delta_z_lens, delta_z_source, m_bias, galaxy_bias,
+    h, omega_b, omega_cdm,
+    cov, data_vector_fid,
+    eps=1e-6
+):
+    print("→ Calling compute_3x2pt_cls...")
+    cl_gg, cl_gk, cl_kk = compute_3x2pt_cls(
+        nz_lens, nz_source, z, k, p_k, ell,
+        delta_z_lens, delta_z_source, m_bias, galaxy_bias,
+        h, omega_b, omega_cdm
+    )
+
+    print("NaN in cl_gg:", jnp.any(jnp.isnan(cl_gg)))
+    print("NaN in cl_gk:", jnp.any(jnp.isnan(cl_gk)))
+    print("NaN in cl_kk:", jnp.any(jnp.isnan(cl_kk)))
+    print("Zero entries in cl_gk:", jnp.sum(cl_gk == 0))
+
+    print("→ Flattening model vector...")
+    model_vector = flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk)
+    print("NaN in model_vector:", jnp.any(jnp.isnan(model_vector)))
+    print("Inf in model_vector:", jnp.any(jnp.isinf(model_vector)))
+    print("model_vector min/max:", jnp.min(model_vector), jnp.max(model_vector))
+
+    delta = model_vector - data_vector_fid
+    print("NaN in delta:", jnp.any(jnp.isnan(delta)))
+    print("delta min/max:", jnp.min(delta), jnp.max(delta))
+
+    cov = jnp.asarray(cov)
+    print("→ Checking covariance matrix...")
+    eigvals = jnp.linalg.eigvalsh(cov)
+    cond = jnp.max(eigvals) / jnp.max(jnp.minimum(eigvals, 1e-20))  # avoid div by 0
+
+    print("min eigval(cov):", jnp.min(eigvals))
+    print("max eigval(cov):", jnp.max(eigvals))
+    print("cond(cov):", cond)
+    print("min diag(cov):", jnp.min(jnp.diag(cov)))
+
+    cov_reg = cov + eps * jnp.eye(cov.shape[0])
+    try:
+        L, lower = cho_factor(cov_reg, lower=True)
+        sol = cho_solve((L, lower), delta)
+        chi2 = delta @ sol
+    except Exception as e:
+        print("Cholesky failed:", e)
+        return -jnp.inf
+
+    if jnp.isnan(chi2) or jnp.isinf(chi2):
+        print("chi2 is invalid (NaN or Inf).")
+        return -jnp.inf
+
+    print("✓ chi2 =", chi2)
+    return -0.5 * chi2
+
+'''
