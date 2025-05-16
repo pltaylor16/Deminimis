@@ -1,6 +1,7 @@
 import jax.numpy as jnp
 from jax import vmap
 from cosmopower_jax.cosmopower_jax import CosmoPowerJAX as CPJ
+from jax import lax
 
 
 def linear_interp1d(x, y):
@@ -22,32 +23,31 @@ def jax_trapz(y, x, axis=-1):
 
 
 def interp2d_linear(z_grid, k_grid, p_grid, z_pts, k_pts):
-    """
-    Bilinear interp of p_grid[z_idx,k_idx] to (z_pts, k_pts).
-    z_pts, k_pts: shape (n_eval,)
-    """
-    # find bracketing indices
-    iz = jnp.clip(jnp.searchsorted(z_grid, z_pts) - 1, 0, len(z_grid) - 2)
-    ik = jnp.clip(jnp.searchsorted(k_grid, k_pts) - 1, 0, len(k_grid) - 2)
+    def interp_single(zi, ki):
+        iz = jnp.clip(jnp.searchsorted(z_grid, zi) - 1, 0, len(z_grid) - 2)
+        ik = jnp.clip(jnp.searchsorted(k_grid, ki) - 1, 0, len(k_grid) - 2)
 
-    z0 = z_grid[iz];   z1 = z_grid[iz + 1]
-    k0 = k_grid[ik];   k1 = k_grid[ik + 1]
+        z0 = lax.dynamic_index_in_dim(z_grid, iz, keepdims=False)
+        z1 = lax.dynamic_index_in_dim(z_grid, iz + 1, keepdims=False)
+        k0 = lax.dynamic_index_in_dim(k_grid, ik, keepdims=False)
+        k1 = lax.dynamic_index_in_dim(k_grid, ik + 1, keepdims=False)
 
-    tz = (z_pts - z0) / (z1 - z0)
-    tk = (k_pts - k0) / (k1 - k0)
+        tz = (zi - z0) / (z1 - z0)
+        tk = (ki - k0) / (k1 - k0)
 
-    p00 = p_grid[iz,     ik    ]
-    p10 = p_grid[iz + 1, ik    ]
-    p01 = p_grid[iz,     ik + 1]
-    p11 = p_grid[iz + 1, ik + 1]
+        # Extract scalar values
+        def get_p(i, j):
+            row = lax.dynamic_index_in_dim(p_grid, i, axis=0, keepdims=False)
+            return lax.dynamic_index_in_dim(row, j, axis=0, keepdims=False)
 
-    # bilinear
-    return (
-        (1-tz)*(1-tk)*p00 +
-         tz*(1-tk)*p10 +
-        (1-tz)* tk *p01 +
-         tz* tk *p11
-    )
+        p00 = get_p(iz,     ik)
+        p10 = get_p(iz + 1, ik)
+        p01 = get_p(iz,     ik + 1)
+        p11 = get_p(iz + 1, ik + 1)
+
+        return (1 - tz)*(1 - tk)*p00 + tz*(1 - tk)*p10 + (1 - tz)*tk*p01 + tz*tk*p11
+
+    return vmap(interp_single)(z_pts, k_pts)  # returns shape (n_z,)
 
 
 
@@ -153,156 +153,83 @@ def compute_3x2pt_cls(
     delta_z_lens, delta_z_source, m_bias, galaxy_bias,
     h, omega_b, omega_cdm
 ):
-    """
-    Compute 3x2pt angular Cl’s under Limber.
-
-    Returns
-    -------
-    cl_gg : (n_lens,n_lens,n_ell)
-    cl_gk : (n_lens,n_source,n_ell)
-    cl_kk : (n_source,n_source,n_ell)
-    """
-    c = 299792.458                   # km/s
-    H0 = 100.0 * h                   # km/s/Mpc
+    c = 299792.458
+    H0 = 100.0 * h
     Omega_m = (omega_b + omega_cdm) / h**2
     Omega_L = 1.0 - Omega_m
 
-    # ---- comoving distance chi(z) ----
-    Ez_inv = 1.0 / jnp.sqrt(Omega_m*(1+z)**3 + Omega_L)
+    Ez_inv = 1.0 / jnp.sqrt(Omega_m * (1 + z)**3 + Omega_L)
     dz = jnp.diff(z)
-    mid = 0.5*(Ez_inv[:-1] + Ez_inv[1:])
-    chi = c/H0 * jnp.concatenate([jnp.array([0.0]), jnp.cumsum(mid * dz)])
+    chi = c / H0 * jnp.concatenate([jnp.array([0.0]), jnp.cumsum(0.5 * (Ez_inv[:-1] + Ez_inv[1:]) * dz)])
 
-    # ---- integration weight for Limber (dz integral) ----
-    # integrand factor: (c/H0)*Ez_inv/(chi^2)
-    weight_z = (c/H0) * Ez_inv / (chi**2)
-
-    # ---- shift & normalize n(z) ----
-    def shift_norm(nz, dzs):
-        interp = linear_interp1d(z, nz)
-        nz_sh = interp(z + dzs)
-        return nz_sh / jax_trapz(nz_sh, z)
-
-    nz_l_sh = vmap(shift_norm)(nz_lens, delta_z_lens)    # (n_lens,n_z)
-    nz_s_sh = vmap(shift_norm)(nz_source, delta_z_source)# (n_source,n_z)
-
-    # ---- lensing kernel W_kappa^i(z) ----
-    prefac2 = 1.5 * Omega_m * (H0**2)/(c**2) * (1+z) * chi  # (n_z,)
-
-    def make_q(nz_sh_i):
-        # for each z_j integrate from j→end: ∫ dz' nz_sh_i(z')*(χ(z')-χ(z_j))/χ(z')
-        def Q_j(j):
-            chi_j = chi[j]
-            chi_slice = chi[j:]
-            nz_slice  = nz_sh_i[j:]
-            integrand = nz_slice * (chi_slice - chi_j) / chi_slice
-            return jax_trapz(integrand, z[j:])
-        Q = jnp.array([Q_j(j) for j in range(z.shape[0])])
-        return prefac2 * Q
-
-    q_s = vmap(make_q)(nz_s_sh)  # (n_source,n_z)
-
-    # ---- Cl integrand generator ----
-def compute_3x2pt_cls(
-    nz_lens, nz_source, z, k, p_k, ell,
-    delta_z_lens, delta_z_source, m_bias, galaxy_bias,
-    h, omega_b, omega_cdm
-):
-    """
-    Compute 3x2pt angular Cl’s under Limber, returning:
-      cl_gg: (n_lens,n_lens,n_ell)
-      cl_gk: (n_lens,n_source,n_ell)
-      cl_kk: (n_source,n_source,n_ell)
-    """
-    c   = 299792.458            # km/s
-    H0  = 100.0 * h             # km/s/Mpc
-    Om  = (omega_b + omega_cdm) / h**2
-    Ol  = 1.0 - Om
-
-    # ---- compute comoving distance chi(z) ----
-    Ez_inv = 1.0 / jnp.sqrt(Om*(1+z)**3 + Ol)      # (n_z,)
-    dzs    = jnp.diff(z)
-    mid    = 0.5 * (Ez_inv[:-1] + Ez_inv[1:])
-    chi    = c/H0 * jnp.concatenate([jnp.array([0.0]), jnp.cumsum(mid * dzs)])  # (n_z,)
-    
-    # Cut z=0 (chi=0) to avoid 1/chi issues
-    z     = z[1:]
-    chi   = chi[1:]
+    # Cut z=0 where chi=0
+    z = z[1:]
+    chi = chi[1:]
     Ez_inv = Ez_inv[1:]
     nz_lens = nz_lens[:, 1:]
     nz_source = nz_source[:, 1:]
-    p_k   = p_k[1:, :]
+    p_k = p_k[1:, :]
 
-    # ---- Limber weight: (c/H0)*Ez_inv/chi^2, but zero out at chi=0 ----
-    w_z = (c/H0) * Ez_inv / (chi**2)
-    w_z = jnp.where(chi > 0, w_z, 0.0)             # avoid divide-by-zero
+    w_z = (c / H0) * Ez_inv / (chi**2)
 
-    # ---- shift & normalize n(z) ----
-    def shift_norm(nz, dzs):
-        f = linear_interp1d(z, nz)
-        nzs = f(z + dzs)
-        return nzs / jax_trapz(nzs, z)
+    def shift_nz(nz, dz):
+        z_shifted = z + dz
+        iz = jnp.clip(jnp.searchsorted(z, z_shifted) - 1, 0, len(z) - 2)
+        z0 = z[iz]
+        z1 = z[iz + 1]
+        y0 = nz[iz]
+        y1 = nz[iz + 1]
+        val = y0 + (y1 - y0) * (z_shifted - z0) / (z1 - z0)
+        return val / jax_trapz(val, z)
 
-    nzl_sh = vmap(shift_norm)(nz_lens,   delta_z_lens)   # (n_lens,n_z)
-    nzs_sh = vmap(shift_norm)(nz_source, delta_z_source) # (n_source,n_z)
+    nzl_sh = vmap(shift_nz)(nz_lens, delta_z_lens)
+    nzs_sh = vmap(shift_nz)(nz_source, delta_z_source)
 
-    # ---- build lensing kernel q_i(z) ----
-    prefac = 1.5 * Om * (H0**2)/(c**2) * (1+z) * chi       # (n_z,)
-    def make_q(nzi):
-        # Q_j = ∫_{z_j}^{z_max} dz' nzi(z')*(chi'-chi_j)/chi'
+    prefac = 1.5 * Omega_m * (H0 / c)**2 * (1 + z) * chi
+
+    def make_q(nz_i):
         def Q_j(j):
-            chi_j    = chi[j]
-            chi_sl   = chi[j:]
-            nz_sl    = nzi[j:]
-            integrand= nz_sl * (chi_sl - chi_j) / chi_sl
-            return jax_trapz(integrand, z[j:])
-        Q = jnp.array([Q_j(j) for j in range(z.shape[0])])
-        return prefac * Q
+            # Create slice starting at j
+            length = len(z)
+            idx = jnp.arange(length)
+            mask = idx >= j
 
-    q_s = vmap(make_q)(nzs_sh)  # (n_source,n_z)
+            chi_j = chi[j]
+            chi_s = chi * mask
+            nz_s = nz_i * mask
 
-    # ---- single-ℓ integrand ----
-    '''
-    def cl_int(W1, W2, ell_val):
-        k_pts  = ell_val / chi                       # (n_z,)
-        P_ell  = interp2d_linear(z, k, p_k, z, k_pts) # (n_z,)
+            # Avoid dividing by zero
+            chi_ratio = jnp.where(mask, (chi_s - chi_j) / chi_s, 0.0)
+
+            integrand = nz_s * chi_ratio
+            return jax_trapz(integrand, z)
+
+        return prefac * vmap(Q_j)(jnp.arange(len(z)))
+
+    q_s = vmap(make_q)(nzs_sh)
+
+    def cl_integrand(W1, W2, ell_val):
+        k_vals = jnp.where(chi > 0, ell_val / chi, 0.0)
+        k_vals = jnp.clip(k_vals, k[0] + 1e-6, k[-1] - 1e-6)
+        P_ell = interp2d_linear(z, k, p_k, z, k_vals)
+        print("W1", W1.shape, "W2", W2.shape, "P_ell", P_ell.shape, "w_z", w_z.shape)
         return jax_trapz(W1 * W2 * P_ell * w_z, z)
-    '''
 
-    def cl_int(W1, W2, ell_val):
-        k_pts  = jnp.where(chi > 0, ell_val / chi, 0.0)
-        k_pts  = jnp.clip(k_pts, k[0] + 1e-6, k[-1] - 1e-6)
-        P_ell  = interp2d_linear(z, k, p_k, z, k_pts)
-        integrand = W1 * W2 * P_ell * w_z
-        #print("ell =", ell_val, "integrand =", integrand[:5])
-        #print (jax_trapz(integrand, z))
-        return jax_trapz(integrand, z)
+    def cl_gg_fn(i, j):
+        return vmap(lambda l: galaxy_bias[i] * galaxy_bias[j] * cl_integrand(nzl_sh[i], nzl_sh[j], l))(ell)
 
-    # ---- build C_ell arrays ----
-    n_l, n_z   = nzl_sh.shape
-    n_s, _     = nzs_sh.shape
-    n_ell      = ell.shape[0]
+    def cl_gk_fn(i, j):
+        return vmap(lambda l: galaxy_bias[i] * (1 + m_bias[j]) * cl_integrand(nzl_sh[i], q_s[j], l))(ell)
 
-    cl_gg = jnp.stack([
-        jnp.stack([
-            galaxy_bias[i] * galaxy_bias[j] *
-            jnp.array([cl_int(nzl_sh[i], nzl_sh[j], L) for L in ell])
-        for j in range(n_l)], axis=0)
-    for i in range(n_l)], axis=0)
+    def cl_kk_fn(i, j):
+        return vmap(lambda l: (1 + m_bias[i]) * (1 + m_bias[j]) * cl_integrand(q_s[i], q_s[j], l))(ell)
 
-    cl_gk = jnp.stack([
-        jnp.stack([
-            galaxy_bias[i] * (1 + m_bias[j]) *
-            jnp.array([cl_int(nzl_sh[i], q_s[j], L) for L in ell])
-        for j in range(n_s)], axis=0)
-    for i in range(n_l)], axis=0)
+    n_l = nzl_sh.shape[0]
+    n_s = nzs_sh.shape[0]
 
-    cl_kk = jnp.stack([
-        jnp.stack([
-            (1 + m_bias[i]) * (1 + m_bias[j]) *
-            jnp.array([cl_int(q_s[i], q_s[j], L) for L in ell])
-        for j in range(n_s)], axis=0)
-    for i in range(n_s)], axis=0)
+    cl_gg = vmap(lambda i: vmap(lambda j: cl_gg_fn(i, j))(jnp.arange(n_l)))(jnp.arange(n_l))
+    cl_gk = vmap(lambda i: vmap(lambda j: cl_gk_fn(i, j))(jnp.arange(n_s)))(jnp.arange(n_l))
+    cl_kk = vmap(lambda i: vmap(lambda j: cl_kk_fn(i, j))(jnp.arange(n_s)))(jnp.arange(n_s))
 
     return cl_gg, cl_gk, cl_kk
 
