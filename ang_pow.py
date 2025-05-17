@@ -177,13 +177,14 @@ def compute_3x2pt_cls(
 
     def shift_nz(nz, dz):
         z_shifted = z + dz
-        iz = jnp.clip(jnp.searchsorted(z, z_shifted) - 1, 0, len(z) - 2)
-        z0 = z[iz]
-        z1 = z[iz + 1]
-        y0 = nz[iz]
-        y1 = nz[iz + 1]
-        val = y0 + (y1 - y0) * (z_shifted - z0) / (z1 - z0)
-        return val / jax_trapz(val, z)
+
+        def linear_interp(xi):
+            # Use weights based on distance to grid centers
+            diffs = jnp.abs(z - xi)
+            weights = jnp.maximum(1 - diffs / jnp.mean(jnp.diff(z)), 0.0)
+            return jnp.sum(nz * weights) / jnp.sum(weights)
+
+        return vmap(linear_interp)(z_shifted)
 
     nzl_sh = vmap(shift_nz)(nz_lens, delta_z_lens)
     nzs_sh = vmap(shift_nz)(nz_source, delta_z_source)
@@ -191,23 +192,22 @@ def compute_3x2pt_cls(
     prefac = 1.5 * Omega_m * (H0 / c)**2 * (1 + z) * chi
 
     def make_q(nz_i):
-        def Q_j(j):
-            # Create slice starting at j
-            length = len(z)
-            idx = jnp.arange(length)
-            mask = idx >= j
-
+        def q_integrand(j):
             chi_j = chi[j]
-            chi_s = chi * mask
-            nz_s = nz_i * mask
+            chi_s = chi
+            nz_s = nz_i
 
-            # Avoid dividing by zero
-            chi_ratio = jnp.where(mask, (chi_s - chi_j) / chi_s, 0.0)
+            # Safe denominator
+            denom = jnp.where(chi_s > 1e-6, chi_s, 1e-6)
+
+            # Compute chi ratio only where chi_s > chi_j
+            valid = chi_s > chi_j
+            chi_ratio = jnp.where(valid, (chi_s - chi_j) / denom, 0.0)
 
             integrand = nz_s * chi_ratio
             return jax_trapz(integrand, z)
 
-        return prefac * vmap(Q_j)(jnp.arange(len(z)))
+        return prefac * vmap(q_integrand)(jnp.arange(len(z)))
 
     q_s = vmap(make_q)(nzs_sh)
 
@@ -218,21 +218,44 @@ def compute_3x2pt_cls(
         #print("W1", W1.shape, "W2", W2.shape, "P_ell", P_ell.shape, "w_z", w_z.shape)
         return jax_trapz(W1 * W2 * P_ell * w_z, z)
 
+    # --- Define individual Cl functions with safe indexing ---
     def cl_gg_fn(i, j):
-        return vmap(lambda l: galaxy_bias[i] * galaxy_bias[j] * cl_integrand(nzl_sh[i], nzl_sh[j], l))(ell)
+        bi = lax.dynamic_index_in_dim(galaxy_bias, i, axis=0)
+        bj = lax.dynamic_index_in_dim(galaxy_bias, j, axis=0)
+        nz_i = lax.dynamic_index_in_dim(nzl_sh, i, axis=0)
+        nz_j = lax.dynamic_index_in_dim(nzl_sh, j, axis=0)
+        return vmap(lambda l: bi * bj * cl_integrand(nz_i, nz_j, l))(ell)  # (n_ell,)
 
     def cl_gk_fn(i, j):
-        return vmap(lambda l: galaxy_bias[i] * (1 + m_bias[j]) * cl_integrand(nzl_sh[i], q_s[j], l))(ell)
+        bi = lax.dynamic_index_in_dim(galaxy_bias, i, axis=0)
+        mj = lax.dynamic_index_in_dim(m_bias, j, axis=0)
+        nz_i = lax.dynamic_index_in_dim(nzl_sh, i, axis=0)
+        qj   = lax.dynamic_index_in_dim(q_s, j, axis=0)
+        return vmap(lambda l: bi * (1.0 + mj) * cl_integrand(nz_i, qj, l))(ell)
 
     def cl_kk_fn(i, j):
-        return vmap(lambda l: (1 + m_bias[i]) * (1 + m_bias[j]) * cl_integrand(q_s[i], q_s[j], l))(ell)
+        mi = lax.dynamic_index_in_dim(m_bias, i, axis=0)
+        mj = lax.dynamic_index_in_dim(m_bias, j, axis=0)
+        qi = lax.dynamic_index_in_dim(q_s, i, axis=0)
+        qj = lax.dynamic_index_in_dim(q_s, j, axis=0)
+        return vmap(lambda l: (1.0 + mi) * (1.0 + mj) * cl_integrand(qi, qj, l))(ell)
 
+    # Number of lens/source bins
     n_l = nzl_sh.shape[0]
     n_s = nzs_sh.shape[0]
 
-    cl_gg = vmap(lambda i: vmap(lambda j: cl_gg_fn(i, j))(jnp.arange(n_l)))(jnp.arange(n_l))
-    cl_gk = vmap(lambda i: vmap(lambda j: cl_gk_fn(i, j))(jnp.arange(n_s)))(jnp.arange(n_l))
-    cl_kk = vmap(lambda i: vmap(lambda j: cl_kk_fn(i, j))(jnp.arange(n_s)))(jnp.arange(n_s))
+    # Create index arrays
+    lens_idx = jnp.arange(n_l)
+    src_idx  = jnp.arange(n_s)
+
+    # Apply vmaps
+    cl_gg = vmap(lambda i: vmap(lambda j: cl_gg_fn(i, j))(lens_idx))(lens_idx)  # (n_l, n_l, n_ell)
+    cl_gk = vmap(lambda i: vmap(lambda j: cl_gk_fn(i, j))(src_idx))(lens_idx)   # (n_l, n_s, n_ell)
+    cl_kk = vmap(lambda i: vmap(lambda j: cl_kk_fn(i, j))(src_idx))(src_idx)    # (n_s, n_s, n_ell)
+
+    cl_gg = jnp.squeeze(cl_gg, axis=-1)
+    cl_gk = jnp.squeeze(cl_gk, axis=-1)
+    cl_kk = jnp.squeeze(cl_kk, axis=-1)
 
     return cl_gg, cl_gk, cl_kk
 
