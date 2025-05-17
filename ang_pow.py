@@ -4,6 +4,8 @@ from jax import vmap
 from jax import lax
 from jax.scipy.linalg import cho_solve, cho_factor
 from cosmopower_jax.cosmopower_jax import CosmoPowerJAX as CPJ
+import optax
+from jax import jit, value_and_grad
 
 
 def linear_interp1d(x, y):
@@ -573,3 +575,161 @@ def minimize_loglike_grad_descent(
             break
 
     return theta, loglike_fn(theta, *args)
+
+
+
+def minimize_loglike_optax(
+    theta_init,
+    loglike_fn,
+    args=(),
+    lr=1e-3,
+    max_iter=500,
+    tol=1e-6,
+    verbose=True
+):
+    """
+    Minimize negative log-likelihood using optax.adam.
+
+    Parameters
+    ----------
+    theta_init : jnp.ndarray
+        Initial parameter vector.
+
+    loglike_fn : callable
+        JAX-safe function: loglike_fn(theta, *args)
+
+    args : tuple
+        Extra arguments to pass to loglike_fn.
+
+    lr : float
+        Learning rate for optimizer.
+
+    max_iter : int
+        Maximum number of iterations.
+
+    tol : float
+        Early stopping tolerance on ||grad||.
+
+    verbose : bool
+        Whether to print progress.
+
+    Returns
+    -------
+    theta_best : jnp.ndarray
+        Optimized parameter vector.
+
+    loglike_best : float
+        Final log-likelihood value.
+    """
+    # Set up optimizer
+    opt = optax.adam(learning_rate=lr)
+    opt_state = opt.init(theta_init)
+    theta = theta_init
+
+    @jit
+    def step(theta, opt_state):
+        loss, grad = value_and_grad(lambda th: -loglike_fn(th, *args))(theta)
+        updates, opt_state = opt.update(grad, opt_state)
+        theta = optax.apply_updates(theta, updates)
+        return theta, opt_state, loss, grad
+
+    for i in range(max_iter):
+        theta, opt_state, loss, grad = step(theta, opt_state)
+        grad_norm = jnp.linalg.norm(grad)
+
+        if verbose and (i % 10 == 0 or i == max_iter - 1):
+            print(f"Iter {i:03d} | -loglike: {loss:.6f} | ||grad||: {grad_norm:.2e}")
+
+        if grad_norm < tol:
+            if verbose:
+                print("Early stopping: gradient norm below tolerance.")
+            break
+
+    final_loglike = loglike_fn(theta, *args)
+    return theta, final_loglike
+
+
+def minimize_loglike_optax_normalized(
+    theta_init,
+    loglike_fn,
+    args=(),
+    lr=1e-2,
+    max_iter=500,
+    tol=1e-6,
+    verbose=True
+):
+    """
+    Minimize loglike_fn using optax.adam in normalized parameter space.
+
+    Parameters
+    ----------
+    theta_init : jnp.ndarray
+        Initial parameter vector (physical units).
+
+    loglike_fn : callable
+        JAX-safe loglike(theta, *args) function in physical space.
+
+    args : tuple
+        Extra arguments to pass to loglike_fn.
+
+    lr : float
+        Learning rate.
+
+    max_iter : int
+        Maximum iterations.
+
+    tol : float
+        Early stopping threshold on gradient norm.
+
+    verbose : bool
+        Print progress.
+
+    Returns
+    -------
+    theta_best : jnp.ndarray
+        Best-fit parameters (physical space).
+
+    loglike_best : float
+        Final log-likelihood.
+    """
+    # Estimate scale for normalization
+    mu = theta_init
+    sigma = jnp.abs(theta_init) + 1e-6  # Avoid division by zero
+
+    # Normalize initial guess
+    theta_norm = jnp.zeros_like(theta_init)
+
+    # Optimizer
+    opt = optax.chain(
+        optax.clip_by_global_norm(10.0),
+        optax.adam(lr)
+    )
+    opt_state = opt.init(theta_norm)
+
+    # Wrapped loss: maps normalized -> physical
+    def loss_fn(theta_norm):
+        theta_phys = mu + sigma * theta_norm
+        return -loglike_fn(theta_phys, *args)
+
+    @jit
+    def step(theta_norm, opt_state):
+        loss, grad = value_and_grad(loss_fn)(theta_norm)
+        updates, opt_state = opt.update(grad, opt_state)
+        theta_norm = optax.apply_updates(theta_norm, updates)
+        return theta_norm, opt_state, loss, grad
+
+    for i in range(max_iter):
+        theta_norm, opt_state, loss, grad = step(theta_norm, opt_state)
+        grad_norm = jnp.linalg.norm(grad)
+
+        if verbose and (i % 10 == 0 or i == max_iter - 1):
+            print(f"Iter {i:03d} | -loglike: {loss:.6f} | ||grad||: {grad_norm:.2e}")
+
+        if grad_norm < tol:
+            print("✓ Early stopping: ||grad|| below tolerance.")
+            break
+
+    # Return final physical theta and loglike
+    theta_best = mu + sigma * theta_norm
+    loglike_best = loglike_fn(theta_best, *args)
+    return theta_best, loglike_best
