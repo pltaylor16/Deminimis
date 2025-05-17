@@ -5,7 +5,8 @@ from jax import lax
 from jax.scipy.linalg import cho_solve, cho_factor
 from cosmopower_jax.cosmopower_jax import CosmoPowerJAX as CPJ
 import optax
-from jax import jit, value_and_grad
+from jax import jit, value_and_grad, jvp, grad, jacrev
+from jax.scipy.sparse.linalg import cg
 
 
 def linear_interp1d(x, y):
@@ -733,3 +734,70 @@ def minimize_loglike_optax_normalized(
     theta_best = mu + sigma * theta_norm
     loglike_best = loglike_fn(theta_best, *args)
     return theta_best, loglike_best
+
+
+def newton_optimize(
+    loglike_fn,
+    theta_init,
+    args=(),
+    max_iter=100,
+    tol=1e-6,
+    alpha=1.0,
+    verbose=False
+):
+    """
+    Newton optimizer using Hessian-vector products with conjugate gradient solver.
+
+    Parameters
+    ----------
+    loglike_fn : callable
+        JAX-compatible log-likelihood function.
+    theta_init : jnp.ndarray
+        Initial parameter guess.
+    args : tuple
+        Extra arguments for loglike_fn.
+    max_iter : int
+        Maximum number of iterations.
+    tol : float
+        Convergence tolerance on gradient norm.
+    alpha : float
+        Step size scaling.
+    verbose : bool
+        Print diagnostic info if True.
+
+    Returns
+    -------
+    theta_best : jnp.ndarray
+        Optimized parameters.
+    loglike_best : float
+        Final log-likelihood value.
+    """
+    grad_fn = grad(loglike_fn)
+
+    @jit
+    def hvp(theta, v, *args):
+        return jvp(lambda t: grad_fn(t, *args), (theta,), (v,))[1]
+
+    theta = theta_init
+
+    for i in range(max_iter):
+        g = grad_fn(theta, *args)
+        g_norm = jnp.linalg.norm(g)
+
+        if verbose:
+            val = loglike_fn(theta, *args)
+            print(f"Iter {i:03d} | -loglike: {val:.6f} | ||grad||: {g_norm:.2e}")
+
+        if g_norm < tol:
+            break
+
+        def matvec(v):
+            return hvp(theta, v, *args)
+
+        dx, _ = cg(matvec, -g, tol=1e-3, maxiter=50)
+        theta = theta + alpha * dx
+
+    return theta, loglike_fn(theta, *args)
+
+
+
