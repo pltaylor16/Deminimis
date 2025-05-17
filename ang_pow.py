@@ -210,7 +210,7 @@ def compute_3x2pt_cls(
     q_s = vmap(make_q)(nzs_sh)
 
     def cl_integrand(W1, W2, ell_val):
-        k_vals = jnp.where(chi > 0, ell_val / chi, 0.0)
+        k_vals = jnp.where(chi > 0, ell_val / chi * h, 0.0) # fixed to make sure chi and k have the same units
         k_vals = jnp.clip(k_vals, k[0] + 1e-6, k[-1] - 1e-6)
         P_ell = interp2d_linear(z, k, p_k, z, k_vals)
         #print("W1", W1.shape, "W2", W2.shape, "P_ell", P_ell.shape, "w_z", w_z.shape)
@@ -275,12 +275,6 @@ def flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk):
     return jnp.concatenate([gg_flat, gk_flat, kk_flat])
 
 
-
-import numpy as np
-import jax.numpy as jnp
-
-import numpy as np
-import jax.numpy as jnp
 
 def compute_gaussian_covariance_matrix(
     cl_gg, cl_gk, cl_kk, ell, n_eff, sigma_eps_sq, fsky
@@ -414,105 +408,74 @@ def gaussian_loglike(
     return -0.5 * chi2
 
 
-
-''''
-def gaussian_loglike(
-    nz_lens, nz_source, z, k, p_k, ell,
-    delta_z_lens, delta_z_source, m_bias, galaxy_bias,
-    h, omega_b, omega_cdm,
-    cov, data_vector_fid
+def loglike_jax_wrapper(
+    theta,              # 1D jnp.ndarray
+    n_bins,             # shared for lens/source
+    z,                  # redshift array (n_z,)
+    ell,                # multipole centers
+    cov,                # (n_data, n_data) covariance matrix
+    data_vector_fid     # (n_data,) fiducial data vector
 ):
     """
-    JAX-safe Gaussian log-likelihood for 3x2pt data vector.
+    JAX-safe log-likelihood wrapper.
 
     Parameters
     ----------
-    All inputs match compute_3x2pt_cls, plus:
+    theta : jnp.ndarray
+        Flat parameter vector:
+        [omega_b, omega_cdm, h, n_s, ln10^10_A_s,
+         c_min, eta_0,
+         galaxy_bias (n_bins),
+         delta_z (n_bins),
+         m_bias (n_bins)]
 
-    cov : (n_data, n_data) ndarray (NOT traced)
-        Precomputed data covariance matrix (NumPy or JAX array, assumed constant).
+    n_bins : int
+        Number of tomographic bins (same for lens/source)
 
-    data_vector_fid : (n_data,) jnp.ndarray
-        Fiducial data vector (used as the observed data).
+    z : jnp.ndarray
+        Redshift grid for n(z) and P(k,z)
+
+    ell : jnp.ndarray
+        Multipole centers
+
+    cov : jnp.ndarray or np.ndarray
+        Covariance matrix
+
+    data_vector_fid : jnp.ndarray
+        Fiducial 3x2pt data vector
 
     Returns
     -------
     loglike : float
-        Gaussian log-likelihood value.
+        Gaussian log-likelihood value
     """
-    cl_gg, cl_gk, cl_kk = compute_3x2pt_cls(
+    idx = 0
+    omega_b   = theta[idx]; idx += 1
+    omega_cdm = theta[idx]; idx += 1
+    h         = theta[idx]; idx += 1
+    n_s       = theta[idx]; idx += 1
+    ln10As    = theta[idx]; idx += 1
+    c_min     = theta[idx]; idx += 1
+    eta_0     = theta[idx]; idx += 1
+
+    galaxy_bias = theta[idx : idx + n_bins]; idx += n_bins
+    delta_z     = theta[idx : idx + n_bins]; idx += n_bins
+    m_bias      = theta[idx : idx + n_bins]; idx += n_bins
+
+    cosmo_params = jnp.array([omega_b, omega_cdm, h, n_s, ln10As])
+
+    # Compute nonlinear P(k, z)
+    emulator = CPJ(probe='mpk_nonlin')
+    k, p_k = compute_nonlinear_pk(z, cosmo_params, c_min, eta_0, emulator)
+
+    # Recompute n(z)
+    nz_lens = compute_nz_bins(z, n_bins, z0=0.64)
+    nz_source = compute_nz_bins(z, n_bins, z0=0.64)
+
+    # Compute log-likelihood
+    return gaussian_loglike(
         nz_lens, nz_source, z, k, p_k, ell,
-        delta_z_lens, delta_z_source, m_bias, galaxy_bias,
-        h, omega_b, omega_cdm
+        delta_z, delta_z, m_bias, galaxy_bias,
+        h, omega_b, omega_cdm,
+        cov, data_vector_fid
     )
-
-    model_vector = flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk)
-    delta = model_vector - data_vector_fid
-
-    # Cholesky solve is faster + stable than full inverse
-    cov = jnp.asarray(cov)
-    L, lower = cho_factor(cov, lower=True)
-    chi2 = delta @ cho_solve((L, lower), delta)
-
-    print ('chi2', chi2)
-    loglike = -0.5 * chi2
-    return loglike
-
-
-
-def gaussian_loglike_debug(
-    nz_lens, nz_source, z, k, p_k, ell,
-    delta_z_lens, delta_z_source, m_bias, galaxy_bias,
-    h, omega_b, omega_cdm,
-    cov, data_vector_fid,
-    eps=1e-6
-):
-    print("→ Calling compute_3x2pt_cls...")
-    cl_gg, cl_gk, cl_kk = compute_3x2pt_cls(
-        nz_lens, nz_source, z, k, p_k, ell,
-        delta_z_lens, delta_z_source, m_bias, galaxy_bias,
-        h, omega_b, omega_cdm
-    )
-
-    print("NaN in cl_gg:", jnp.any(jnp.isnan(cl_gg)))
-    print("NaN in cl_gk:", jnp.any(jnp.isnan(cl_gk)))
-    print("NaN in cl_kk:", jnp.any(jnp.isnan(cl_kk)))
-    print("Zero entries in cl_gk:", jnp.sum(cl_gk == 0))
-
-    print("→ Flattening model vector...")
-    model_vector = flatten_cls_to_vector_jax_safe(cl_gg, cl_gk, cl_kk)
-    print("NaN in model_vector:", jnp.any(jnp.isnan(model_vector)))
-    print("Inf in model_vector:", jnp.any(jnp.isinf(model_vector)))
-    print("model_vector min/max:", jnp.min(model_vector), jnp.max(model_vector))
-
-    delta = model_vector - data_vector_fid
-    print("NaN in delta:", jnp.any(jnp.isnan(delta)))
-    print("delta min/max:", jnp.min(delta), jnp.max(delta))
-
-    cov = jnp.asarray(cov)
-    print("→ Checking covariance matrix...")
-    eigvals = jnp.linalg.eigvalsh(cov)
-    cond = jnp.max(eigvals) / jnp.max(jnp.minimum(eigvals, 1e-20))  # avoid div by 0
-
-    print("min eigval(cov):", jnp.min(eigvals))
-    print("max eigval(cov):", jnp.max(eigvals))
-    print("cond(cov):", cond)
-    print("min diag(cov):", jnp.min(jnp.diag(cov)))
-
-    cov_reg = cov + eps * jnp.eye(cov.shape[0])
-    try:
-        L, lower = cho_factor(cov_reg, lower=True)
-        sol = cho_solve((L, lower), delta)
-        chi2 = delta @ sol
-    except Exception as e:
-        print("Cholesky failed:", e)
-        return -jnp.inf
-
-    if jnp.isnan(chi2) or jnp.isinf(chi2):
-        print("chi2 is invalid (NaN or Inf).")
-        return -jnp.inf
-
-    print("✓ chi2 =", chi2)
-    return -0.5 * chi2
-
-'''
