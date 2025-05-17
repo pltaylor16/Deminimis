@@ -287,6 +287,7 @@ def compute_gaussian_covariance_matrix(
     """
 
     # Convert to NumPy *after* copying, so we modify noise safely
+    import numpy as np
     cl_gg = np.array(cl_gg.copy())
     cl_gk = np.array(cl_gk.copy())
     cl_kk = np.array(cl_kk.copy())
