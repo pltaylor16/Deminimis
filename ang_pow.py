@@ -1,7 +1,9 @@
+import jax
 import jax.numpy as jnp
 from jax import vmap
 from jax import lax
 from jax.scipy.linalg import cho_solve, cho_factor
+from cosmopower_jax.cosmopower_jax import CosmoPowerJAX as CPJ
 
 
 def linear_interp1d(x, y):
@@ -480,3 +482,71 @@ def loglike_jax_wrapper(
         h, omega_b, omega_cdm,
         cov, data_vector_fid
     )
+
+
+def minimize_loglike_grad_descent(
+    theta_init,
+    loglike_fn,        # callable(theta, *args)
+    args=(),           # additional args to pass to loglike_fn
+    lr=1e-3,           # learning rate
+    max_iter=500,
+    tol=1e-6,
+    verbose=True
+):
+    """
+    Minimize -loglike_fn using gradient descent.
+
+    Parameters
+    ----------
+    theta_init : jnp.ndarray
+        Initial guess for parameters.
+
+    loglike_fn : callable
+        Function to minimize, signature loglike(theta, *args)
+
+    args : tuple
+        Additional arguments for loglike_fn
+
+    lr : float
+        Learning rate
+
+    max_iter : int
+        Maximum number of iterations
+
+    tol : float
+        Convergence tolerance on |grad|
+
+    verbose : bool
+        Whether to print progress
+
+    Returns
+    -------
+    theta_best : jnp.ndarray
+        Optimized parameters
+
+    loglike_val : float
+        Final log-likelihood value
+    """
+
+    def step(theta):
+        val = -loglike_fn(theta, *args)  # minimize negative loglike
+        grad_val = jax.grad(lambda th: -loglike_fn(th, *args))(theta)
+        return val, grad_val
+
+    @jax.jit
+    def update(theta):
+        val, grad_val = step(theta)
+        theta_new = theta - lr * grad_val
+        return theta_new, val, jnp.linalg.norm(grad_val)
+
+    theta = theta_init
+    for i in range(max_iter):
+        theta, val, grad_norm = update(theta)
+        if verbose and i % 10 == 0:
+            print(f"Iter {i:03d} | -loglike: {val:.6f} | ||grad||: {grad_norm:.2e}")
+        if grad_norm < tol:
+            if verbose:
+                print(f"Converged at iter {i}: ||grad|| < {tol}")
+            break
+
+    return theta, loglike_fn(theta, *args)
